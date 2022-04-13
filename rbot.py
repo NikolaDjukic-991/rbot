@@ -19,6 +19,7 @@ import logging
 import hashlib
 import threading
 import json
+import os
 from discord.ext import commands
 
 #
@@ -29,6 +30,7 @@ import strings as message
 #
 # Globals
 #
+RBOT_HOME = None
 TOKEN = None
 SAMPLE_DIR = None
 YTDL_DIR   = None
@@ -43,12 +45,17 @@ bot = commands.Bot(command_prefix='!', description=description, intents=intents)
 
 # Initializes global settings and sets up bot configuration
 def globalInit():
+    global RBOT_HOME
     global TOKEN
     global SAMPLE_DIR
     global YTDL_DIR
 
+    RBOT_HOME = os.environ.get("RBOT_HOME")
+    if RBOT_HOME == None:
+        RBOT_HOME="./"
+
     try:
-        with open("$RBOT_HOME/config.cfg", "r") as cfgFile:
+        with open(RBOT_HOME + "/config.cfg", "r") as cfgFile:
             for line in cfgFile:
                 keyValPair = line.split(":", 1)
                 key = keyValPair[0].strip()
@@ -327,7 +334,6 @@ async def getVoiceChannelByUsername(guild, name):
                 return channel
 
     return None
-
 
 async def _joinHelper(ctx):
     cmdRequester = ctx.message.author
