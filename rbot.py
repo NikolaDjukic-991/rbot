@@ -1,13 +1,22 @@
-
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
-# OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
-# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
-# OR OTHER DEALINGS IN THE SOFTWARE.
+# Copyright (c) 2022 NikolaDjukic-991
 #
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 #
 # External imports
@@ -62,14 +71,18 @@ def globalInit():
                 value = keyValPair[1].strip()
 
                 if key == "TOKEN":
-                    TOKEN = value
+                    TOKEN = os.path.expandvars(value)
                 elif key == "SAMPLE_DIR":
-                    SAMPLE_DIR = value
+                    SAMPLE_DIR = os.path.expandvars(value)
                 elif key == "YTDL_DIR":
-                    YTDL_DIR = value
+                    YTDL_DIR = os.path.expandvars(value)
     except IOError:
         print("Error reading config.cfg")
         return -1
+
+    print(RBOT_HOME)
+    print(SAMPLE_DIR)
+    print(YTDL_DIR)
 
     FFMPEG_OPTIONS = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5','options': '-vn'}
 
@@ -79,19 +92,31 @@ def globalInit():
 # Classes
 #
 class YTLinkInfo:
-    def __init__(self, jsonObj):
-        self.title = jsonObj["title"]
+    def __init__():
+        self.title = ""
         self.requestedUrl = None
         self.urls = []
-        self.duration = jsonObj["duration"]
+        self.duration = -1
+
+
+    @staticmethod
+    def createYTLinkInfoFromJson(self, jsonObj):
+        info = YTLinkInfo()
+
+        info.title = jsonObj["title"]
+        info.requestedUrl = None
+        info.urls = []
+        info.duration = jsonObj["duration"]
 
         for fmt in jsonObj["formats"]:
             if fmt["format"].find("audio only"):
-                self.urls.append(fmt["url"])
+                info.urls.append(fmt["url"])
 
         for requestedFmt in jsonObj["requested_formats"]:
             if requestedFmt["format"].find("audio only"):
-                self.requestedUrl = requestedFmt["url"]
+                info.requestedUrl = requestedFmt["url"]
+
+        return info
 
 class PlaylistRequest:
     """Represents a queable sound to be played by the bot"""
@@ -107,9 +132,10 @@ class PlaylistRequest:
         # TODO: Need error handling and validation for links
         # TODO: Need to transition to parsing the JSON object instead of only grabbing the URL.
         # TODO: Implement parsing for artist/title/length.
-        ytdlProcessJSON = subprocess.run(["youtube-dl", "--audio-quality", "0", "-j", link], capture_output=True, text=True)
-        ytdlJson = json.loads(ytdlProcessJSON.stdout)
-        ytLinkInfo = YTLinkInfo(ytdlJson)
+        ytdlProcessJson = subprocess.run(["youtube-dl", "--audio-quality", "0", "-j", link], capture_output=True, text=True)
+
+        ytdlJson = json.loads(ytdlProcessJson.stdout)
+        ytLinkInfo = YTLinkInfo.createYTLinkInfoFromJson(ytdlJson)
 
         # TODO: Not sure if creating the object is going to preload when the source is a link.
         if preload == True:
@@ -120,13 +146,11 @@ class PlaylistRequest:
 
     # Factory method to create PlaylistRequests from soundbyte paths
     @staticmethod
-    def createPlaylistRequestFromPath(fname, requester, preload = False):
+    def createPlaylistRequestFromPath(fname, requester, preload = True):
         sndAbsPath = SAMPLE_DIR + fname.strip()
-        if preload == True:
-            soundDataStream = discord.FFmpegOpusAudio(sndAbsPath, options='-vn')
-        else:
-            soundDataStream = None
-        return PlaylistRequest(soundDataStream, sndAbsPath, requester)
+
+        soundDataStream = discord.FFmpegOpusAudio(sndAbsPath, options='-vn')
+        return PlaylistRequest(YTLinkInfo(), requester, soundDataStream)
 
     def isLoaded(self):
         return self.soundDataStream != None
@@ -134,7 +158,7 @@ class PlaylistRequest:
     def load(self):
         if self.soundDataStream != None:
             return False
-        self.soundDataStream = discord.FFmpegOpusAudio(self.trackInfo.requestedUrl, options='-vn')
+        self.soundDataStream = discord.FFmpegPCMAudio(self.trackInfo.requestedUrl, options="-vn")
         self.state = "queued-loaded"
         return True
 
@@ -364,21 +388,21 @@ async def on_ready():
     print(bot.user.id)
     print('------')
 
-# TODO: Need to make sure bot disconnects if connected for too long.
 @bot.command()
 async def v(ctx, byteName : str):
-    """Join requested"""
+    """Play soundboard effect."""
     player = await playerManager.createAndRegisterNewPlayer(ctx)
-
-    player.addToPlaylistFromPath(byteName, ctx.message.author)
-
-    if player.isPlaying() == False:
-        await ctx.send(message.getString("Soundbyte"))
-        player.startPlaying()
+    rqs = PlaylistRequest.createPlaylistRequestFromPath(byteName, ctx.message.author, True)
+    rqs.load()
+    audioStream = rqs.getAudio()
+    audioData = audioStream.read()
+    while len(audioData) != 0:
+        player.voiceClient.send_audio_packet(audioData, encode=False)
+        audioData = audioStream.read()
 
 @bot.command()
 async def play(ctx, link : str):
-    """Play YT link"""
+    """Play audio from youtube link."""
     player = await playerManager.createAndRegisterNewPlayer(ctx)
 
     playlistRequest = player.addToPlaylistFromLink(link, ctx.message.author)
@@ -391,7 +415,7 @@ async def play(ctx, link : str):
 
 @bot.command()
 async def pause(ctx):
-    """Pause playing"""
+    """Pause playing."""
     player = playerManager.getPlayerByGuildId(ctx.message.channel.guild.id)
 
     userVoiceChannel = await getVoiceChannelByUsername(ctx.message.channel.guild, ctx.message.author)
@@ -405,7 +429,7 @@ async def pause(ctx):
 
 @bot.command()
 async def resume(ctx):
-    """Resume playing"""
+    """Resume playing."""
     player = playerManager.getPlayerByGuildId(ctx.message.channel.guild.id)
 
     userVoiceChannel = await getVoiceChannelByUsername(ctx.message.channel.guild, ctx.message.author)
@@ -419,7 +443,7 @@ async def resume(ctx):
 
 @bot.command()
 async def skip(ctx):
-    """Skip current item"""
+    """Skip current playlist item."""
     player = playerManager.getPlayerByGuildId(ctx.message.channel.guild.id)
 
     userVoiceChannel = await getVoiceChannelByUsername(ctx.message.channel.guild, ctx.message.author)
@@ -431,6 +455,7 @@ async def skip(ctx):
 
 @bot.command()
 async def join(ctx):
+    """Request bot to join voice channel."""
     await ctx.send(message.getString("Join"))
     await playerManager.createAndRegisterNewPlayer(ctx)
 
@@ -438,6 +463,11 @@ async def join(ctx):
 async def leave(ctx):
     """Leave channel"""
     await playerManager.destroyPlayer(ctx.message.channel.guild.id)
+
+@bot.command()
+async def about(ctx):
+    """About this bot"""
+    await ctx.send(message.getAboutMessage())
 
 #
 # Create PlayerManager singleton and run the bot
