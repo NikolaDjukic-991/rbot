@@ -46,7 +46,7 @@ YTDL_DIR   = None
 FFMPEG_OPTIONS = None
 
 # TODO: Move this out
-intents = discord.Intents.default()
+intents = discord.Intents.all()
 intents.members = True
 description = '''revbot'''
 
@@ -65,6 +65,7 @@ def globalInit():
 
     try:
         with open(RBOT_HOME + "/config.cfg", "r") as cfgFile:
+            print("opened config.cfg")
             for line in cfgFile:
                 keyValPair = line.split(":", 1)
                 key = keyValPair[0].strip()
@@ -80,9 +81,9 @@ def globalInit():
         print("Error reading config.cfg")
         return -1
 
-    print(RBOT_HOME)
-    print(SAMPLE_DIR)
-    print(YTDL_DIR)
+    print("Home: " + RBOT_HOME)
+    print("Samples: " + SAMPLE_DIR)
+    print("Yydl dir: " + YTDL_DIR)
 
     FFMPEG_OPTIONS = {'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5','options': '-vn'}
 
@@ -92,31 +93,26 @@ def globalInit():
 # Classes
 #
 class YTLinkInfo:
-    def __init__():
+    def __init__(self):
         self.title = ""
         self.requestedUrl = None
         self.urls = []
         self.duration = -1
 
 
-    @staticmethod
     def createYTLinkInfoFromJson(self, jsonObj):
-        info = YTLinkInfo()
-
-        info.title = jsonObj["title"]
-        info.requestedUrl = None
-        info.urls = []
-        info.duration = jsonObj["duration"]
+        self.title = jsonObj["title"]
+        self.requestedUrl = None
+        self.urls = []
+        self.duration = jsonObj["duration"]
 
         for fmt in jsonObj["formats"]:
             if fmt["format"].find("audio only"):
-                info.urls.append(fmt["url"])
+                self.urls.append(fmt["url"])
 
         for requestedFmt in jsonObj["requested_formats"]:
             if requestedFmt["format"].find("audio only"):
-                info.requestedUrl = requestedFmt["url"]
-
-        return info
+                self.requestedUrl = requestedFmt["url"]
 
 class PlaylistRequest:
     """Represents a queable sound to be played by the bot"""
@@ -132,10 +128,11 @@ class PlaylistRequest:
         # TODO: Need error handling and validation for links
         # TODO: Need to transition to parsing the JSON object instead of only grabbing the URL.
         # TODO: Implement parsing for artist/title/length.
-        ytdlProcessJson = subprocess.run(["youtube-dl", "--audio-quality", "0", "-j", link], capture_output=True, text=True)
+        ytdlProcessJson = subprocess.run(["python3", "/mnt/d/Nikola/Crap/rbot_git/youtube-dl/bin/youtube-dl", "--audio-quality", "0", "-j", link], capture_output=True, text=True)
 
         ytdlJson = json.loads(ytdlProcessJson.stdout)
-        ytLinkInfo = YTLinkInfo.createYTLinkInfoFromJson(ytdlJson)
+        ytLinkInfo = YTLinkInfo()
+        ytLinkInfo.createYTLinkInfoFromJson(jsonObj=ytdlJson)
 
         # TODO: Not sure if creating the object is going to preload when the source is a link.
         if preload == True:
@@ -465,9 +462,16 @@ async def leave(ctx):
     await playerManager.destroyPlayer(ctx.message.channel.guild.id)
 
 @bot.command()
+async def stop(ctx):
+    """Leave channel"""
+    await playerManager.destroyPlayer(ctx.message.channel.guild.id)
+
+@bot.command()
 async def about(ctx):
     """About this bot"""
     await ctx.send(message.getAboutMessage())
+
+
 
 #
 # Create PlayerManager singleton and run the bot
