@@ -1,0 +1,4 @@
+discord.py[voice]>=2.7.1,<3
+discord-ext-voice-recv @ https://github.com/jstewart0788/discord-ext-voice-recv-dave/archive/4cbbec2.zip
+davey>=0.1.4
+yt-dlp[default]
