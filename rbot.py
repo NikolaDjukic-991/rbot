@@ -45,6 +45,8 @@ from revbot.audio.capture import (
 )
 from revbot.audio.player import Player
 from revbot.audio.manager import PlayerManager, find_voice_channel_by_member, join_voice_channel
+from revbot.audio.storage import global_sound_directory, guild_sound_directory, has_revbot_admin_role
+from revbot.command_channels import CommandChannelStore
 from revbot.config import (
     ConfigurationError,
     expand_config_path,
@@ -74,10 +76,34 @@ CAPTURE_CODEC = "libopus"
 CAPTURE_BITRATE = "64k"
 CAPTURE_EXTENSIONS = {".ogg", ".wav"}
 UNNAMED_CAPTURE_RETENTION_SECONDS = 7 * 24 * 60 * 60
+COMMAND_CHANNELS = None
 
 intents = discord.Intents.all()
 intents.members = True
 bot = commands.Bot(command_prefix="!", description="revbot", intents=intents)
+
+
+def should_process_command(ctx):
+    """Filter commands by guild text channel, leaving admins able to manage the filter."""
+    if ctx.guild is None or COMMAND_CHANNELS is None:
+        return True
+    allowed_channel_id = COMMAND_CHANNELS.get(ctx.guild.id)
+    if allowed_channel_id is None or ctx.channel.id == allowed_channel_id:
+        return True
+    return bool(
+        ctx.command is not None
+        and ctx.command.name == "channel"
+        and has_revbot_admin_role(ctx)
+    )
+
+
+@bot.event
+async def on_message(incoming_message):
+    if incoming_message.author.bot:
+        return
+    ctx = await bot.get_context(incoming_message)
+    if should_process_command(ctx):
+        await bot.invoke(ctx)
 
 
 def _expand_config_path(value):
@@ -91,11 +117,12 @@ def _is_configured_token(token):
 
 
 def globalInit():
-    global RBOT_HOME, TOKEN, SAMPLE_DIR, TEMP_DIR, FFMPEG_EXECUTABLE
+    global RBOT_HOME, TOKEN, SAMPLE_DIR, TEMP_DIR, FFMPEG_EXECUTABLE, COMMAND_CHANNELS
 
     bot_home = Path(os.environ.get("RBOT_HOME", Path(__file__).resolve().parent)).expanduser().resolve()
     try:
         settings = load_settings(bot_home)
+        global_sound_directory(settings.sample_dir)
     except ConfigurationError as error:
         logging.error("%s", error)
         return -1
@@ -104,6 +131,8 @@ def globalInit():
         return -1
 
     RBOT_HOME = settings.bot_home
+    COMMAND_CHANNELS = CommandChannelStore(RBOT_HOME / "command_channels.json")
+    COMMAND_CHANNELS.load()
     TOKEN = settings.token
     SAMPLE_DIR = settings.sample_dir
     TEMP_DIR = settings.temp_dir
@@ -162,6 +191,7 @@ playerManager = PlayerManager(
 @bot.event
 async def on_ready():
     logging.info("Logged in as %s (%s)", bot.user.name, bot.user.id)
+    await bot.change_presence(activity=discord.Game(name="!help"))
     if not cleanup_expired_captures.is_running():
         cleanup_expired_captures.start()
 
@@ -191,6 +221,8 @@ def _make_command_services():
     return SimpleNamespace(
         player_manager=lambda: playerManager,
         sample_dir=lambda: SAMPLE_DIR,
+        guild_sound_dir=lambda guild: guild_sound_directory(SAMPLE_DIR, guild),
+        global_sound_dir=lambda: global_sound_directory(SAMPLE_DIR),
         temp_dir=lambda: TEMP_DIR,
         ffmpeg_executable=lambda: FFMPEG_EXECUTABLE,
         last_captures=LAST_CAPTURES,
@@ -204,6 +236,8 @@ def _make_command_services():
         ffmpeg_available=lambda executable: _ffmpeg_is_available(executable),
         messages=message,
         runner_path=lambda: Path(__file__).with_name("rbot_tests.py"),
+        is_revbot_admin=has_revbot_admin_role,
+        command_channels=lambda: COMMAND_CHANNELS,
     )
 
 

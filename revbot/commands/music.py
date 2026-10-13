@@ -6,6 +6,7 @@ import logging
 import subprocess
 
 from revbot.audio.sources import AudioRequest
+from revbot.commands.permissions import require_revbot_admin
 
 
 
@@ -66,7 +67,9 @@ def register(bot, services):
 
     @bot.command()
     async def health(ctx):
-        """Show non-sensitive bot and voice-playback diagnostics."""
+        """Show bot and playback diagnostics (revbot_admin only)."""
+        if not await require_revbot_admin(ctx, services):
+            return
         ffmpeg_ready = services.ffmpeg_available(services.ffmpeg_executable())
         player = services.player_manager().getPlayerByGuildId(ctx.guild.id)
         lines = [

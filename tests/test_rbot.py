@@ -87,15 +87,29 @@ class RbotUnitTests(unittest.TestCase):
         rbot.SAMPLE_DIR = SAMPLE_FILE.parent.resolve()
         rbot.TEMP_DIR = REPOSITORY_DIR / "temp"
         rbot.FFMPEG_EXECUTABLE = "ffmpeg"
+        rbot.COMMAND_CHANNELS = None
         rbot.LAST_CAPTURES.clear()
 
     def test_required_commands_are_exposed(self):
         expected = {
-            "v", "cap", "renamecap", "soundboard", "play", "pause", "resume",
+            "v", "cap", "renamecap", "soundboard", "play", "pause", "resume", "channel",
             "skip", "volume", "now", "health", "queue", "clear", "remove", "join", "leave", "stop", "stopall", "about", "test",
         }
         self.assertTrue(expected.issubset({command.name for command in rbot.bot.commands}))
         self.assertIs(rbot.bot.get_command("soundbytes"), rbot.soundboard)
+
+    def test_ready_event_sets_help_presence(self):
+        fake_bot = SimpleNamespace(
+            user=SimpleNamespace(name="revbot", id=123),
+            change_presence=AsyncMock(),
+        )
+        with patch.object(rbot, "bot", fake_bot), \
+             patch.object(rbot.cleanup_expired_captures, "is_running", return_value=True), \
+             patch.object(rbot.logging, "info"):
+            asyncio.run(rbot.on_ready())
+        fake_bot.change_presence.assert_awaited_once()
+        activity = fake_bot.change_presence.await_args.kwargs["activity"]
+        self.assertEqual(activity.name, "!help")
 
     def test_audio_primitives_are_extracted_behind_compatible_entrypoint(self):
         self.assertEqual(rbot.TrackInfo.__module__, "revbot.audio.sources")
@@ -108,7 +122,60 @@ class RbotUnitTests(unittest.TestCase):
         self.assertEqual(rbot.cap.callback.__module__, "revbot.commands.soundboard")
         self.assertEqual(rbot.play.callback.__module__, "revbot.commands.music")
         self.assertEqual(rbot.join.callback.__module__, "revbot.commands.voice")
+        self.assertEqual(rbot.channel.callback.__module__, "revbot.commands.voice")
         self.assertEqual(rbot.about.callback.__module__, "revbot.commands.general")
+
+    def test_channel_command_persists_and_clears_server_setting(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
+            store = rbot.CommandChannelStore(Path(directory) / "command_channels.json")
+            guild = SimpleNamespace(id=7)
+            target = SimpleNamespace(id=99, guild=guild, mention="<#99>")
+            context = SimpleNamespace(
+                guild=guild,
+                author=SimpleNamespace(roles=[SimpleNamespace(name="revbot_admin")]),
+                send=AsyncMock(),
+            )
+            with patch.object(rbot, "COMMAND_CHANNELS", store):
+                asyncio.run(rbot.channel.callback(context, target))
+                self.assertEqual(store.get(7), 99)
+                reloaded = rbot.CommandChannelStore(store.path)
+                reloaded.load()
+                self.assertEqual(reloaded.get(7), 99)
+
+                asyncio.run(rbot.channel.callback(context))
+                self.assertIsNone(store.get(7))
+                reloaded.load()
+                self.assertIsNone(reloaded.get(7))
+            self.assertIn("<#99>", context.send.await_args_list[0].args[0])
+            self.assertIn("all text channels", context.send.await_args_list[1].args[0])
+
+    def test_command_filter_limits_commands_to_configured_text_channel(self):
+        store = rbot.CommandChannelStore(Path(TEST_ENVIRONMENT) / "channel-filter-test.json")
+        store.set(7, 99)
+        guild = SimpleNamespace(id=7)
+        author = SimpleNamespace(roles=[])
+        configured_channel = SimpleNamespace(id=99)
+        outside_channel = SimpleNamespace(id=100)
+        normal_command = SimpleNamespace(name="play")
+        admin_command = SimpleNamespace(name="channel")
+        admin = SimpleNamespace(roles=[SimpleNamespace(name="REVBot_Admin")])
+
+        with patch.object(rbot, "COMMAND_CHANNELS", store):
+            self.assertTrue(rbot.should_process_command(SimpleNamespace(
+                guild=guild, channel=configured_channel, author=author, command=normal_command
+            )))
+            self.assertFalse(rbot.should_process_command(SimpleNamespace(
+                guild=guild, channel=outside_channel, author=author, command=normal_command
+            )))
+            self.assertFalse(rbot.should_process_command(SimpleNamespace(
+                guild=guild, channel=outside_channel, author=author, command=admin_command
+            )))
+            self.assertTrue(rbot.should_process_command(SimpleNamespace(
+                guild=guild, channel=outside_channel, author=admin, command=admin_command
+            )))
+            self.assertFalse(rbot.should_process_command(SimpleNamespace(
+                guild=guild, channel=outside_channel, author=admin, command=normal_command
+            )))
 
     def test_config_expansion_and_initialization(self):
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
@@ -129,6 +196,7 @@ class RbotUnitTests(unittest.TestCase):
             self.assertEqual(rbot.TEMP_DIR, (root / "temp").resolve())
             self.assertEqual(rbot.FFMPEG_EXECUTABLE, "fake-ffmpeg")
             self.assertFalse(expired_capture.exists())
+            self.assertTrue((root / "samples" / "globals").is_dir())
 
     def test_config_prefers_environment_token_and_rejects_missing_dependencies(self):
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
@@ -318,8 +386,10 @@ class RbotUnitTests(unittest.TestCase):
     def test_capture_storage_evicts_oldest_automatic_captures(self):
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
             sample_dir = Path(directory).resolve()
-            oldest = sample_dir / "cap_oldest.wav"
-            newest = sample_dir / "cap_newest.wav"
+            guild_dir = sample_dir / "guild-test-server-7"
+            guild_dir.mkdir()
+            oldest = guild_dir / "cap_oldest.wav"
+            newest = guild_dir / "cap_newest.wav"
             oldest.write_bytes(b"12345")
             newest.write_bytes(b"67890")
             os.utime(oldest, (100, 100))
@@ -336,8 +406,10 @@ class RbotUnitTests(unittest.TestCase):
     def test_expired_unnamed_captures_are_pruned_without_touching_named_soundbytes(self):
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
             sample_dir = Path(directory).resolve()
-            old_capture = sample_dir / "cap_old.ogg"
-            fresh_capture = sample_dir / "cap_fresh.ogg"
+            guild_dir = sample_dir / "guild-test-server-7"
+            guild_dir.mkdir()
+            old_capture = guild_dir / "cap_old.ogg"
+            fresh_capture = guild_dir / "cap_fresh.ogg"
             named_sound = sample_dir / "favorite.ogg"
             for sound in (old_capture, fresh_capture, named_sound):
                 sound.write_bytes(b"audio")
@@ -398,7 +470,11 @@ class RbotUnitTests(unittest.TestCase):
             isPlaying=Mock(return_value=False),
             getVolume=Mock(return_value=100),
         )
-        context = SimpleNamespace(guild=SimpleNamespace(id=1), send=AsyncMock())
+        context = SimpleNamespace(
+            guild=SimpleNamespace(id=1),
+            author=SimpleNamespace(roles=[SimpleNamespace(name="revbot_admin")]),
+            send=AsyncMock(),
+        )
         with patch.object(rbot, "_ffmpeg_is_available", return_value=True), \
              patch.object(rbot.playerManager, "getPlayerByGuildId", return_value=player), \
              patch.object(rbot.bot, "is_ready", return_value=True):
@@ -408,6 +484,21 @@ class RbotUnitTests(unittest.TestCase):
         self.assertIn("FFmpeg: ready", report)
         self.assertIn("100% volume", report)
         self.assertNotIn("TOKEN", report)
+
+    def test_health_and_test_commands_require_revbot_admin_role(self):
+        context = SimpleNamespace(
+            guild=SimpleNamespace(id=1),
+            author=SimpleNamespace(roles=[SimpleNamespace(name="member")]),
+            send=AsyncMock(),
+        )
+        with patch.object(rbot, "_ffmpeg_is_available") as ffmpeg_check, \
+             patch.object(rbot.subprocess, "run") as run_tests:
+            asyncio.run(rbot.health.callback(context))
+            asyncio.run(rbot.test.callback(context))
+        ffmpeg_check.assert_not_called()
+        run_tests.assert_not_called()
+        self.assertEqual(context.send.await_count, 2)
+        self.assertTrue(all("revbot_admin" in call.args[0] for call in context.send.await_args_list))
 
     def test_play_rejects_tracks_over_duration_limit(self):
         player = SimpleNamespace(queue_music=Mock())
@@ -433,12 +524,83 @@ class RbotUnitTests(unittest.TestCase):
 
     def test_soundboard_command_queues_lighter(self):
         player = SimpleNamespace(queue_sound=Mock())
-        context = SimpleNamespace(author="tester", send=AsyncMock())
+        context = SimpleNamespace(
+            guild=SimpleNamespace(id=1, name="Test Guild"),
+            author=SimpleNamespace(roles=[SimpleNamespace(name="revbot_admin")]),
+            send=AsyncMock(),
+        )
         with patch.object(rbot.playerManager, "createAndRegisterNewPlayer", AsyncMock(return_value=player)):
             asyncio.run(rbot.v.callback(context, "Lighter.wav"))
         queued = player.queue_sound.call_args.args[0]
         self.assertEqual(Path(queued.source), SAMPLE_FILE)
         context.send.assert_awaited_once_with(rbot.message.getString("Soundbyte"))
+
+    def test_non_admin_can_play_only_sounds_from_their_guild(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
+            sample_dir = Path(directory).resolve()
+            rbot.SAMPLE_DIR = sample_dir
+            guild = SimpleNamespace(id=7, name="Local Server")
+            own_dir = rbot.guild_sound_directory(sample_dir, guild)
+            other_dir = rbot.guild_sound_directory(sample_dir, SimpleNamespace(id=8, name="Other Server"))
+            own_sound = own_dir / "local.wav"
+            own_sound.write_bytes(b"local")
+            (sample_dir / "shared.wav").write_bytes(b"shared")
+            global_dir = rbot.global_sound_directory(sample_dir)
+            (global_dir / "public.wav").write_bytes(b"public")
+            (other_dir / "other.wav").write_bytes(b"other")
+            player = SimpleNamespace(queue_sound=Mock())
+            manager = SimpleNamespace(createAndRegisterNewPlayer=AsyncMock(return_value=player))
+            context = SimpleNamespace(
+                guild=guild,
+                author=SimpleNamespace(id=21, roles=[SimpleNamespace(name="member")]),
+                send=AsyncMock(),
+            )
+
+            with patch.object(rbot, "playerManager", manager):
+                asyncio.run(rbot.v.callback(context, "local.wav"))
+                self.assertEqual(Path(player.queue_sound.call_args.args[0].source), own_sound)
+                asyncio.run(rbot.v.callback(context, "public.wav"))
+                self.assertEqual(Path(player.queue_sound.call_args.args[-1].source), global_dir / "public.wav")
+                player.queue_sound.reset_mock()
+                manager.createAndRegisterNewPlayer.reset_mock()
+
+                for unavailable_sound in ("shared.wav", "../shared.wav", "../guild-other-server-8/other.wav"):
+                    with self.subTest(sound=unavailable_sound):
+                        asyncio.run(rbot.v.callback(context, unavailable_sound))
+                        player.queue_sound.assert_not_called()
+                        manager.createAndRegisterNewPlayer.assert_not_awaited()
+                        response = context.send.call_args.args[0].lower()
+                        self.assertTrue("not found" in response or "invalid" in response)
+
+    def test_admin_can_play_shared_and_other_guild_sounds(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
+            sample_dir = Path(directory).resolve()
+            rbot.SAMPLE_DIR = sample_dir
+            (sample_dir / "shared.wav").write_bytes(b"shared")
+            global_dir = rbot.global_sound_directory(sample_dir)
+            (global_dir / "public.wav").write_bytes(b"public")
+            other_dir = rbot.guild_sound_directory(sample_dir, SimpleNamespace(id=8, name="Other Server"))
+            (other_dir / "other.wav").write_bytes(b"other")
+            player = SimpleNamespace(queue_sound=Mock())
+            manager = SimpleNamespace(createAndRegisterNewPlayer=AsyncMock(return_value=player))
+            context = SimpleNamespace(
+                guild=SimpleNamespace(id=7, name="Local Server"),
+                author=SimpleNamespace(roles=[SimpleNamespace(name="revbot_admin")]),
+                send=AsyncMock(),
+            )
+
+            with patch.object(rbot, "playerManager", manager):
+                asyncio.run(rbot.v.callback(context, "shared.wav"))
+                asyncio.run(rbot.v.callback(context, "globals/public.wav"))
+                asyncio.run(rbot.v.callback(context, "guild-other-server-8/other.wav"))
+                asyncio.run(rbot.soundboard.callback(context))
+
+            played = [Path(call.args[0].source) for call in player.queue_sound.call_args_list]
+            self.assertEqual(played, [sample_dir / "shared.wav", global_dir / "public.wav", other_dir / "other.wav"])
+            listing = context.send.call_args_list[-1].args[0]
+            self.assertIn("shared.wav", listing)
+            self.assertIn("globals/public.wav", listing)
+            self.assertIn("guild-other-server-8/other.wav", listing)
 
     def test_capture_command_saves_snapshot(self):
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
@@ -451,7 +613,8 @@ class RbotUnitTests(unittest.TestCase):
                 capture_recent_voice=Mock(return_value=b"captured-pcm"),
             )
             context = SimpleNamespace(
-                guild=SimpleNamespace(id=1), author=SimpleNamespace(id=2), send=AsyncMock()
+                guild=SimpleNamespace(id=1, name="Test Guild"),
+                author=SimpleNamespace(id=2, roles=[]), send=AsyncMock()
             )
 
             def encode_capture(path, pcm):
@@ -467,23 +630,60 @@ class RbotUnitTests(unittest.TestCase):
             make_room.assert_called_once_with(len(b"compressed-ogg"))
             self.assertIn("Saved the last five seconds", context.send.call_args.args[0])
             saved_capture = rbot.LAST_CAPTURES[(1, 2)]
+            self.assertEqual(saved_capture.parent.name, "guild-test-guild-1")
             self.assertNotIn(saved_capture.name, context.send.call_args.args[0])
             self.assertIn("!renamecap <name>", context.send.call_args.args[0])
             self.assertTrue(saved_capture.is_file())
             self.assertEqual(saved_capture.suffix, ".ogg")
 
+    def test_capture_avoids_existing_global_sound_name(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
+            root = Path(directory).resolve()
+            rbot.SAMPLE_DIR = root / "samples"
+            rbot.SAMPLE_DIR.mkdir()
+            rbot.TEMP_DIR = root / "temp"
+            global_dir = rbot.global_sound_directory(rbot.SAMPLE_DIR)
+            stamp = "20261013_120000_000000"
+            (global_dir / "cap_{}.ogg".format(stamp)).write_bytes(b"global")
+            guild = SimpleNamespace(id=12, name="Collision Test")
+            player = SimpleNamespace(
+                getPlayerChannel=Mock(return_value="voice"),
+                capture_recent_voice=Mock(return_value=b"captured-pcm"),
+            )
+            context = SimpleNamespace(
+                guild=guild, author=SimpleNamespace(id=2), send=AsyncMock()
+            )
+
+            def encode_capture(path, pcm):
+                path.write_bytes(b"captured")
+
+            with patch("revbot.commands.soundboard.datetime") as mocked_datetime, \
+                 patch.object(rbot.playerManager, "getPlayerByGuildId", return_value=player), \
+                 patch.object(rbot, "getVoiceChannelByUsername", AsyncMock(return_value="voice")), \
+                 patch.object(rbot, "_make_room_for_capture"), \
+                 patch.object(rbot, "_write_capture", side_effect=encode_capture):
+                mocked_datetime.now.return_value.strftime.return_value = stamp
+                asyncio.run(rbot.cap.callback(context))
+
+            saved_capture = rbot.LAST_CAPTURES[(12, 2)]
+            self.assertEqual(saved_capture.name, "cap_{}_1.ogg".format(stamp))
+            self.assertEqual(saved_capture.read_bytes(), b"captured")
+            self.assertEqual((global_dir / "cap_{}.ogg".format(stamp)).read_bytes(), b"global")
+
     def test_renamecap_renames_latest_capture_and_preserves_ogg_extension(self):
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
             sample_dir = Path(directory).resolve()
-            source = sample_dir / "cap_latest.ogg"
+            guild = SimpleNamespace(id=7, name="Test Guild")
+            guild_dir = rbot.guild_sound_directory(sample_dir, guild)
+            source = guild_dir / "cap_latest.ogg"
             source.write_bytes(b"captured audio")
             rbot.SAMPLE_DIR = sample_dir
             rbot.LAST_CAPTURES[(7, 42)] = source
-            context = SimpleNamespace(guild=SimpleNamespace(id=7), author=SimpleNamespace(id=42), send=AsyncMock())
+            context = SimpleNamespace(guild=guild, author=SimpleNamespace(id=42), send=AsyncMock())
 
             asyncio.run(rbot.renamecap.callback(context, new_name="My Favorite Sound"))
 
-            destination = sample_dir / "My Favorite Sound.ogg"
+            destination = guild_dir / "My Favorite Sound.ogg"
             self.assertFalse(source.exists())
             self.assertEqual(destination.read_bytes(), b"captured audio")
             self.assertEqual(rbot.LAST_CAPTURES[(7, 42)], destination)
@@ -492,38 +692,62 @@ class RbotUnitTests(unittest.TestCase):
     def test_renamecap_cannot_claim_a_capture_after_restart(self):
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
             sample_dir = Path(directory).resolve()
-            older = sample_dir / "cap_older.ogg"
-            latest = sample_dir / "cap_latest.ogg"
+            guild = SimpleNamespace(id=7, name="Test Guild")
+            guild_dir = rbot.guild_sound_directory(sample_dir, guild)
+            older = guild_dir / "cap_older.ogg"
+            latest = guild_dir / "cap_latest.ogg"
             older.write_bytes(b"older")
             latest.write_bytes(b"latest")
             os.utime(older, (100, 100))
             os.utime(latest, (200, 200))
             rbot.SAMPLE_DIR = sample_dir
-            context = SimpleNamespace(guild=SimpleNamespace(id=7), author=SimpleNamespace(id=42), send=AsyncMock())
+            context = SimpleNamespace(guild=guild, author=SimpleNamespace(id=42), send=AsyncMock())
 
             asyncio.run(rbot.renamecap.callback(context, new_name="Recovered"))
 
             self.assertTrue(older.exists())
             self.assertTrue(latest.exists())
-            self.assertFalse((sample_dir / "Recovered.ogg").exists())
+            self.assertFalse((guild_dir / "Recovered.ogg").exists())
             context.send.assert_awaited_once_with("You don't have a recent capture to rename. Run `!cap` first.")
 
     def test_renamecap_rejects_invalid_names_and_existing_files(self):
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
             sample_dir = Path(directory).resolve()
-            source = sample_dir / "cap_latest.ogg"
-            existing = sample_dir / "Taken.ogg"
+            guild = SimpleNamespace(id=7, name="Test Guild")
+            guild_dir = rbot.guild_sound_directory(sample_dir, guild)
+            source = guild_dir / "cap_latest.ogg"
+            existing = guild_dir / "Taken.ogg"
             source.write_bytes(b"capture")
             existing.write_bytes(b"keep this")
             rbot.SAMPLE_DIR = sample_dir
             rbot.LAST_CAPTURES[(7, 42)] = source
-            context = SimpleNamespace(guild=SimpleNamespace(id=7), author=SimpleNamespace(id=42), send=AsyncMock())
+            context = SimpleNamespace(guild=guild, author=SimpleNamespace(id=42), send=AsyncMock())
 
             asyncio.run(rbot.renamecap.callback(context, new_name="../escape"))
             self.assertTrue(source.exists())
             asyncio.run(rbot.renamecap.callback(context, new_name="Taken"))
             self.assertEqual(existing.read_bytes(), b"keep this")
             self.assertEqual(context.send.await_count, 2)
+
+    def test_renamecap_rejects_global_sound_name_conflict(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
+            sample_dir = Path(directory).resolve()
+            guild = SimpleNamespace(id=7, name="Test Guild")
+            guild_dir = rbot.guild_sound_directory(sample_dir, guild)
+            source = guild_dir / "cap_latest.ogg"
+            source.write_bytes(b"capture")
+            global_dir = rbot.global_sound_directory(sample_dir)
+            global_sound = global_dir / "Taken.ogg"
+            global_sound.write_bytes(b"global")
+            rbot.SAMPLE_DIR = sample_dir
+            rbot.LAST_CAPTURES[(7, 42)] = source
+            context = SimpleNamespace(guild=guild, author=SimpleNamespace(id=42), send=AsyncMock())
+
+            asyncio.run(rbot.renamecap.callback(context, new_name="Taken"))
+
+            self.assertTrue(source.exists())
+            self.assertEqual(global_sound.read_bytes(), b"global")
+            self.assertIn("global soundbyte already uses that name", context.send.call_args.args[0])
 
     def test_renamecap_rejects_invalid_filename_strings(self):
         invalid_names = [
@@ -539,11 +763,13 @@ class RbotUnitTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
             sample_dir = Path(directory).resolve()
-            source = sample_dir / "cap_latest.ogg"
+            guild = SimpleNamespace(id=7, name="Test Guild")
+            guild_dir = rbot.guild_sound_directory(sample_dir, guild)
+            source = guild_dir / "cap_latest.ogg"
             source.write_bytes(b"capture")
             rbot.SAMPLE_DIR = sample_dir
             rbot.LAST_CAPTURES[(7, 42)] = source
-            context = SimpleNamespace(guild=SimpleNamespace(id=7), author=SimpleNamespace(id=42), send=AsyncMock())
+            context = SimpleNamespace(guild=guild, author=SimpleNamespace(id=42), send=AsyncMock())
 
             for invalid_name in invalid_names:
                 with self.subTest(name=invalid_name):
@@ -556,18 +782,25 @@ class RbotUnitTests(unittest.TestCase):
     def test_soundboard_lists_audio_files_and_excludes_other_files(self):
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
             sample_dir = Path(directory).resolve()
-            (sample_dir / "Zebra.ogg").write_bytes(b"ogg")
-            (sample_dir / "alpha.wav").write_bytes(b"wav")
-            (sample_dir / "cover.jpg").write_bytes(b"image")
+            guild = SimpleNamespace(id=7, name="Test Guild")
+            guild_dir = rbot.guild_sound_directory(sample_dir, guild)
+            (guild_dir / "Zebra.ogg").write_bytes(b"ogg")
+            (guild_dir / "alpha.wav").write_bytes(b"wav")
+            (guild_dir / "cover.jpg").write_bytes(b"image")
+            (sample_dir / "shared.ogg").write_bytes(b"shared")
+            global_dir = rbot.global_sound_directory(sample_dir)
+            (global_dir / "Public.ogg").write_bytes(b"public")
             rbot.SAMPLE_DIR = sample_dir
-            context = SimpleNamespace(send=AsyncMock())
+            context = SimpleNamespace(guild=guild, author=SimpleNamespace(roles=[]), send=AsyncMock())
 
             asyncio.run(rbot.soundboard.callback(context))
 
             listing = context.send.call_args.args[0]
             self.assertIn("alpha.wav", listing)
             self.assertIn("Zebra.ogg", listing)
+            self.assertIn("globals/Public.ogg", listing)
             self.assertNotIn("cover.jpg", listing)
+            self.assertNotIn("shared.ogg", listing)
             self.assertLess(listing.index("alpha.wav"), listing.index("Zebra.ogg"))
 
     def test_capture_command_reports_when_no_voice_audio_is_available(self):
@@ -576,7 +809,7 @@ class RbotUnitTests(unittest.TestCase):
             capture_recent_voice=Mock(side_effect=RuntimeError("No voice audio was received during the last five seconds.")),
         )
         context = SimpleNamespace(
-            guild=SimpleNamespace(id=1), author="tester", send=AsyncMock()
+            guild=SimpleNamespace(id=1, name="Test Guild"), author=SimpleNamespace(id=2), send=AsyncMock()
         )
         with patch.object(rbot.playerManager, "getPlayerByGuildId", return_value=player), \
              patch.object(rbot, "getVoiceChannelByUsername", AsyncMock(return_value="voice")):
@@ -624,7 +857,11 @@ class RbotUnitTests(unittest.TestCase):
         self.assertEqual(context.send.await_count, 2)
 
     def test_test_command_reports_runner_result(self):
-        context = SimpleNamespace(send=AsyncMock())
+        context = SimpleNamespace(
+            guild=SimpleNamespace(id=1),
+            author=SimpleNamespace(roles=[SimpleNamespace(name="RevBot_Admin")]),
+            send=AsyncMock(),
+        )
         result = SimpleNamespace(returncode=0, stdout="Ran isolated tests", stderr="")
         with patch.object(rbot.subprocess, "run", return_value=result) as run:
             asyncio.run(rbot.test.callback(context))

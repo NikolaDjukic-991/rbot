@@ -114,7 +114,7 @@ def write_capture(path, pcm, ffmpeg_executable, codec="libopus", bitrate="64k"):
 
 def capture_files(sample_dir, extensions):
     return sorted(
-        (path for path in sample_dir.glob("cap_*") if path.is_file() and path.suffix.lower() in extensions),
+        (path for path in sample_dir.rglob("cap_*") if path.is_file() and path.suffix.lower() in extensions),
         key=lambda path: path.stat().st_mtime,
     )
 

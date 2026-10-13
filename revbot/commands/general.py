@@ -4,6 +4,7 @@ import asyncio
 import subprocess
 import sys
 
+from revbot.commands.permissions import require_revbot_admin
 
 
 def register(bot, services):
@@ -14,7 +15,9 @@ def register(bot, services):
 
     @bot.command(name="test")
     async def test(ctx):
-        """Run the isolated rbot unit-test suite."""
+        """Run the isolated rbot unit-test suite (revbot_admin only)."""
+        if not await require_revbot_admin(ctx, services):
+            return
         runner = services.runner_path()
         loop = asyncio.get_running_loop()
 
