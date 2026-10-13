@@ -1,7 +1,7 @@
 """Unit tests for rbot.
 
 External services are replaced with fakes: these tests do not connect to Discord,
-start FFmpeg, or contact YouTube.  The supplied Lighter.wav and URL are used as
+run FFmpeg, or contact YouTube. The supplied Lighter.wav and URL are used as
 the representative soundboard and music inputs.
 """
 
@@ -14,7 +14,6 @@ import tempfile
 import threading
 import time
 import unittest
-import wave
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
@@ -93,24 +92,54 @@ class RbotUnitTests(unittest.TestCase):
     def test_required_commands_are_exposed(self):
         expected = {
             "v", "cap", "renamecap", "soundboard", "play", "pause", "resume",
-            "skip", "join", "leave", "stop", "stopall", "about", "test",
+            "skip", "volume", "now", "health", "queue", "clear", "remove", "join", "leave", "stop", "stopall", "about", "test",
         }
         self.assertTrue(expected.issubset({command.name for command in rbot.bot.commands}))
         self.assertIs(rbot.bot.get_command("soundbytes"), rbot.soundboard)
 
+    def test_audio_primitives_are_extracted_behind_compatible_entrypoint(self):
+        self.assertEqual(rbot.TrackInfo.__module__, "revbot.audio.sources")
+        self.assertEqual(rbot.AudioRequest.__module__, "revbot.audio.sources")
+        self.assertEqual(rbot.BufferedPCMSource.__module__, "revbot.audio.sources")
+        self.assertEqual(rbot.AudioMixer.__module__, "revbot.audio.mixer")
+        self.assertEqual(rbot.RecentVoiceSink.__module__, "revbot.audio.capture")
+        self.assertEqual(rbot.Player.__module__, "revbot.audio.player")
+        self.assertEqual(rbot.PlayerManager.__module__, "revbot.audio.manager")
+        self.assertEqual(rbot.cap.callback.__module__, "revbot.commands.soundboard")
+        self.assertEqual(rbot.play.callback.__module__, "revbot.commands.music")
+        self.assertEqual(rbot.join.callback.__module__, "revbot.commands.voice")
+        self.assertEqual(rbot.about.callback.__module__, "revbot.commands.general")
+
     def test_config_expansion_and_initialization(self):
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
             root = Path(directory)
+            expired_capture = root / "samples" / "cap_expired.ogg"
+            expired_capture.parent.mkdir()
+            expired_capture.write_bytes(b"old capture")
+            os.utime(expired_capture, (0, 0))
             (root / "config.cfg").write_text(
                 "TOKEN:test-token\nSAMPLE_DIR:${RBOT_HOME}/samples\nTEMP_DIR:${RBOT_HOME}/temp\nFFMPEG:fake-ffmpeg\n",
                 encoding="utf-8",
             )
-            with patch.dict("os.environ", {"RBOT_HOME": str(root)}, clear=False):
+            with patch.dict("os.environ", {"RBOT_HOME": str(root), "DISCORD_TOKEN": ""}, clear=False), \
+                 patch.object(rbot, "_ffmpeg_is_available", return_value=True):
                 self.assertEqual(rbot.globalInit(), 0)
             self.assertEqual(rbot.TOKEN, "test-token")
             self.assertEqual(rbot.SAMPLE_DIR, (root / "samples").resolve())
             self.assertEqual(rbot.TEMP_DIR, (root / "temp").resolve())
             self.assertEqual(rbot.FFMPEG_EXECUTABLE, "fake-ffmpeg")
+            self.assertFalse(expired_capture.exists())
+
+    def test_config_prefers_environment_token_and_rejects_missing_dependencies(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
+            root = Path(directory)
+            (root / "config.cfg").write_text("TOKEN:<Add-Token>\nFFMPEG:missing-ffmpeg\n", encoding="utf-8")
+            with patch.dict("os.environ", {"RBOT_HOME": str(root), "DISCORD_TOKEN": "environment-token"}, clear=False), \
+                 patch.object(rbot, "_ffmpeg_is_available", return_value=False):
+                self.assertEqual(rbot.globalInit(), -1)
+                self.assertEqual(rbot.TOKEN, "environment-token")
+            with patch.dict("os.environ", {"RBOT_HOME": str(root), "DISCORD_TOKEN": ""}, clear=False):
+                self.assertEqual(rbot.globalInit(), -1)
 
     def test_track_info_selects_audio_and_rejects_missing_url(self):
         track = rbot.TrackInfo.from_extractor_json({
@@ -189,18 +218,43 @@ class RbotUnitTests(unittest.TestCase):
         self.assertEqual(resumed_frame[0], int(100 * mixer.MUSIC_GAIN))
         mixer.cleanup()
 
-    def test_recent_voice_snapshot_and_wav_output(self):
+    def test_audio_mixer_tracks_current_requests_and_applies_volume(self):
+        music_request = SimpleNamespace(
+            trackInfo=SimpleNamespace(title="Song"),
+            create_source=Mock(return_value=FakeSource([pcm_frame(100)])),
+        )
+        mixer = rbot.AudioMixer(deque([music_request]), deque(), threading.RLock())
+        mixer.set_master_volume(0.5)
+        samples = array.array("h")
+        samples.frombytes(mixer.read())
+        self.assertEqual(samples[0], int(100 * mixer.MUSIC_GAIN * 0.5))
+        self.assertIs(mixer.current_requests()[0], music_request)
+        mixer.cleanup()
+
+    def test_recent_voice_snapshot_encodes_ogg_opus_output(self):
         sink = rbot.RecentVoiceSink()
         sink.started_at = time.monotonic() - sink.BUFFER_SECONDS
         sink.write("speaker", SimpleNamespace(pcm=pcm_frame(100)))
         captured = sink.snapshot()
         self.assertEqual(len(captured), sink.BUFFER_FRAMES * sink.FRAME_BYTES)
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
-            output = Path(directory) / "capture.wav"
-            rbot._write_capture(output, captured)
-            with wave.open(str(output), "rb") as saved:
-                self.assertEqual(saved.getparams()[:3], (2, 2, 48000))
+            output = Path(directory) / "capture.ogg"
+            result = SimpleNamespace(returncode=0, stderr=b"")
+            with patch.object(rbot.subprocess, "run", return_value=result) as run:
+                rbot._write_capture(output, captured)
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "ffmpeg")
+        self.assertIn("libopus", command)
+        self.assertIn("ogg", command)
+        self.assertEqual(command[-1], str(output))
+        self.assertEqual(run.call_args.kwargs["input"], captured)
         sink.cleanup()
+
+    def test_capture_encoder_reports_ffmpeg_failure(self):
+        result = SimpleNamespace(returncode=1, stderr=b"encoder failed")
+        with patch.object(rbot.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "encoder failed"):
+                rbot._write_capture(Path("capture.ogg"), b"pcm")
 
     def test_player_queue_controls_and_disconnect(self):
         voice_client = FakeVoiceClient()
@@ -211,6 +265,8 @@ class RbotUnitTests(unittest.TestCase):
         player._lock = threading.RLock()
         player._mixer = None
         player._music_paused = False
+        player._music_queue_limit = rbot.MAX_MUSIC_QUEUE_ITEMS
+        player._sound_queue_limit = rbot.MAX_SOUNDBOARD_QUEUE_ITEMS
         player.capture_sink = Mock()
         request = Mock()
         self.assertTrue(player.queue_music(request))
@@ -236,6 +292,133 @@ class RbotUnitTests(unittest.TestCase):
         asyncio.run(disconnect_player())
         self.assertTrue(voice_client.disconnected)
 
+    def test_queue_limits_and_management_helpers(self):
+        player = rbot.Player.__new__(rbot.Player)
+        player.voiceClient = FakeVoiceClient()
+        player.music_queue = deque([Mock()] * rbot.MAX_MUSIC_QUEUE_ITEMS)
+        player.sound_queue = deque([Mock()] * rbot.MAX_SOUNDBOARD_QUEUE_ITEMS)
+        player._lock = threading.RLock()
+        player._mixer = None
+        player._music_queue_limit = rbot.MAX_MUSIC_QUEUE_ITEMS
+        player._sound_queue_limit = rbot.MAX_SOUNDBOARD_QUEUE_ITEMS
+
+        with self.assertRaisesRegex(ValueError, "music queue is full"):
+            player.queue_music(Mock())
+        with self.assertRaisesRegex(ValueError, "soundboard queue is full"):
+            player.queue_sound(Mock())
+
+        first, second = SimpleNamespace(trackInfo=SimpleNamespace(title="First")), SimpleNamespace(trackInfo=SimpleNamespace(title="Second"))
+        player.music_queue = deque([first, second])
+        player.sound_queue = deque([Mock()])
+        self.assertIs(player.remove_queued_music(2), second)
+        self.assertIsNone(player.remove_queued_music(9))
+        self.assertEqual(player.clear_queued_requests(), (1, 1))
+        self.assertEqual(player.queued_requests(), ([], []))
+
+    def test_capture_storage_evicts_oldest_automatic_captures(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
+            sample_dir = Path(directory).resolve()
+            oldest = sample_dir / "cap_oldest.wav"
+            newest = sample_dir / "cap_newest.wav"
+            oldest.write_bytes(b"12345")
+            newest.write_bytes(b"67890")
+            os.utime(oldest, (100, 100))
+            os.utime(newest, (200, 200))
+            rbot.SAMPLE_DIR = sample_dir
+            with patch.object(rbot, "MAX_CAPTURE_STORAGE_BYTES", 10):
+                rbot._make_room_for_capture(4)
+            self.assertFalse(oldest.exists())
+            self.assertTrue(newest.exists())
+            with patch.object(rbot, "MAX_CAPTURE_STORAGE_BYTES", 3):
+                with self.assertRaisesRegex(RuntimeError, "storage is full"):
+                    rbot._make_room_for_capture(4)
+
+    def test_expired_unnamed_captures_are_pruned_without_touching_named_soundbytes(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
+            sample_dir = Path(directory).resolve()
+            old_capture = sample_dir / "cap_old.ogg"
+            fresh_capture = sample_dir / "cap_fresh.ogg"
+            named_sound = sample_dir / "favorite.ogg"
+            for sound in (old_capture, fresh_capture, named_sound):
+                sound.write_bytes(b"audio")
+            now = time.time()
+            os.utime(old_capture, (now - rbot.UNNAMED_CAPTURE_RETENTION_SECONDS - 1, ) * 2)
+            os.utime(named_sound, (now - rbot.UNNAMED_CAPTURE_RETENTION_SECONDS - 1, ) * 2)
+            rbot.SAMPLE_DIR = sample_dir
+            rbot.LAST_CAPTURES[(1, 2)] = old_capture
+
+            self.assertEqual(rbot._delete_expired_unnamed_captures(now), 1)
+
+            self.assertFalse(old_capture.exists())
+            self.assertTrue(fresh_capture.exists())
+            self.assertTrue(named_sound.exists())
+            self.assertNotIn((1, 2), rbot.LAST_CAPTURES)
+
+    def test_queue_management_commands(self):
+        music = [SimpleNamespace(trackInfo=SimpleNamespace(title="Song"))]
+        sounds = [SimpleNamespace(trackInfo=SimpleNamespace(title="Lighter"))]
+        player = SimpleNamespace(
+            queued_requests=Mock(return_value=(music, sounds)),
+            clear_queued_requests=Mock(return_value=(1, 1)),
+            remove_queued_music=Mock(return_value=music[0]),
+        )
+        context = SimpleNamespace(guild=SimpleNamespace(id=1), author="tester", send=AsyncMock())
+        with patch.object(rbot, "_player_for_command", AsyncMock(return_value=player)):
+            asyncio.run(rbot.showqueue.callback(context))
+            asyncio.run(rbot.clear.callback(context))
+            asyncio.run(rbot.remove.callback(context, 1))
+        self.assertIn("Music queue", context.send.await_args_list[0].args[0])
+        self.assertIn("Cleared 1 music", context.send.await_args_list[1].args[0])
+        self.assertIn("Removed queued track: *Song*", context.send.await_args_list[2].args[0])
+
+    def test_volume_command_shows_and_sets_volume(self):
+        player = SimpleNamespace(getVolume=Mock(return_value=100), setVolume=Mock(return_value=75))
+        context = SimpleNamespace(guild=SimpleNamespace(id=1), author="tester", send=AsyncMock())
+        with patch.object(rbot, "_player_for_command", AsyncMock(return_value=player)):
+            asyncio.run(rbot.volume.callback(context))
+            asyncio.run(rbot.volume.callback(context, 75))
+        self.assertIn("Current volume: 100%", context.send.await_args_list[0].args[0])
+        player.setVolume.assert_called_once_with(75)
+        self.assertEqual(context.send.await_args_list[1].args[0], "Volume set to 75%.")
+
+    def test_now_command_lists_active_music_and_soundboard(self):
+        music = SimpleNamespace(trackInfo=SimpleNamespace(title="Song"))
+        sound = SimpleNamespace(trackInfo=SimpleNamespace(title="Lighter"))
+        player = SimpleNamespace(nowPlaying=Mock(return_value=(music, sound, False)))
+        context = SimpleNamespace(guild=SimpleNamespace(id=1), author="tester", send=AsyncMock())
+        with patch.object(rbot, "_player_for_command", AsyncMock(return_value=player)):
+            asyncio.run(rbot.now.callback(context))
+        report = context.send.call_args.args[0]
+        self.assertIn("Music: *Song*", report)
+        self.assertIn("Soundboard: *Lighter*", report)
+
+    def test_health_command_reports_readiness_without_sensitive_config(self):
+        player = SimpleNamespace(
+            nowPlaying=Mock(return_value=(None, None, False)),
+            isPlaying=Mock(return_value=False),
+            getVolume=Mock(return_value=100),
+        )
+        context = SimpleNamespace(guild=SimpleNamespace(id=1), send=AsyncMock())
+        with patch.object(rbot, "_ffmpeg_is_available", return_value=True), \
+             patch.object(rbot.playerManager, "getPlayerByGuildId", return_value=player), \
+             patch.object(rbot.bot, "is_ready", return_value=True):
+            asyncio.run(rbot.health.callback(context))
+        report = context.send.call_args.args[0]
+        self.assertIn("Discord: ready", report)
+        self.assertIn("FFmpeg: ready", report)
+        self.assertIn("100% volume", report)
+        self.assertNotIn("TOKEN", report)
+
+    def test_play_rejects_tracks_over_duration_limit(self):
+        player = SimpleNamespace(queue_music=Mock())
+        track = rbot.TrackInfo("Long track", "https://audio.example/stream", rbot.MAX_TRACK_DURATION_SECONDS + 1)
+        context = SimpleNamespace(author="tester", send=AsyncMock())
+        with patch.object(rbot.playerManager, "createAndRegisterNewPlayer", AsyncMock(return_value=player)), \
+             patch.object(rbot, "_extract_track_info", return_value=track):
+            asyncio.run(rbot.play.callback(context, YOUTUBE_URL))
+        player.queue_music.assert_not_called()
+        self.assertIn("longer than", context.send.call_args.args[0])
+
     def test_voice_channel_helpers(self):
         member = object()
         selected = SimpleNamespace(members=[member])
@@ -258,25 +441,41 @@ class RbotUnitTests(unittest.TestCase):
         context.send.assert_awaited_once_with(rbot.message.getString("Soundbyte"))
 
     def test_capture_command_saves_snapshot(self):
-        player = SimpleNamespace(
-            getPlayerChannel=Mock(return_value="voice"),
-            capture_recent_voice=Mock(return_value=b"captured-pcm"),
-        )
-        context = SimpleNamespace(
-            guild=SimpleNamespace(id=1), author=SimpleNamespace(id=2), send=AsyncMock()
-        )
-        with patch.object(rbot.playerManager, "getPlayerByGuildId", return_value=player), \
-             patch.object(rbot, "getVoiceChannelByUsername", AsyncMock(return_value="voice")), \
-             patch.object(rbot, "_write_capture") as write_capture:
-            asyncio.run(rbot.cap.callback(context))
-        self.assertEqual(write_capture.call_args.args[1], b"captured-pcm")
-        self.assertIn("Saved the last five seconds", context.send.call_args.args[0])
-        self.assertIn((1, 2), rbot.LAST_CAPTURES)
+        with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
+            root = Path(directory)
+            rbot.SAMPLE_DIR = root / "samples"
+            rbot.SAMPLE_DIR.mkdir()
+            rbot.TEMP_DIR = root / "temp"
+            player = SimpleNamespace(
+                getPlayerChannel=Mock(return_value="voice"),
+                capture_recent_voice=Mock(return_value=b"captured-pcm"),
+            )
+            context = SimpleNamespace(
+                guild=SimpleNamespace(id=1), author=SimpleNamespace(id=2), send=AsyncMock()
+            )
 
-    def test_renamecap_renames_latest_capture_and_preserves_wav_extension(self):
+            def encode_capture(path, pcm):
+                path.write_bytes(b"compressed-ogg")
+
+            with patch.object(rbot.playerManager, "getPlayerByGuildId", return_value=player), \
+                 patch.object(rbot, "getVoiceChannelByUsername", AsyncMock(return_value="voice")), \
+                 patch.object(rbot, "_make_room_for_capture") as make_room, \
+                 patch.object(rbot, "_write_capture", side_effect=encode_capture) as write_capture:
+                asyncio.run(rbot.cap.callback(context))
+            self.assertEqual(write_capture.call_args.args[1], b"captured-pcm")
+            self.assertEqual(write_capture.call_args.args[0].suffix, ".ogg")
+            make_room.assert_called_once_with(len(b"compressed-ogg"))
+            self.assertIn("Saved the last five seconds", context.send.call_args.args[0])
+            saved_capture = rbot.LAST_CAPTURES[(1, 2)]
+            self.assertNotIn(saved_capture.name, context.send.call_args.args[0])
+            self.assertIn("!renamecap <name>", context.send.call_args.args[0])
+            self.assertTrue(saved_capture.is_file())
+            self.assertEqual(saved_capture.suffix, ".ogg")
+
+    def test_renamecap_renames_latest_capture_and_preserves_ogg_extension(self):
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
             sample_dir = Path(directory).resolve()
-            source = sample_dir / "cap_latest.wav"
+            source = sample_dir / "cap_latest.ogg"
             source.write_bytes(b"captured audio")
             rbot.SAMPLE_DIR = sample_dir
             rbot.LAST_CAPTURES[(7, 42)] = source
@@ -284,17 +483,17 @@ class RbotUnitTests(unittest.TestCase):
 
             asyncio.run(rbot.renamecap.callback(context, new_name="My Favorite Sound"))
 
-            destination = sample_dir / "My Favorite Sound.wav"
+            destination = sample_dir / "My Favorite Sound.ogg"
             self.assertFalse(source.exists())
             self.assertEqual(destination.read_bytes(), b"captured audio")
             self.assertEqual(rbot.LAST_CAPTURES[(7, 42)], destination)
-            self.assertIn("!v My Favorite Sound.wav", context.send.call_args.args[0])
+            self.assertIn("!v My Favorite Sound.ogg", context.send.call_args.args[0])
 
-    def test_renamecap_finds_existing_capture_after_restart(self):
+    def test_renamecap_cannot_claim_a_capture_after_restart(self):
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
             sample_dir = Path(directory).resolve()
-            older = sample_dir / "cap_older.wav"
-            latest = sample_dir / "cap_latest.wav"
+            older = sample_dir / "cap_older.ogg"
+            latest = sample_dir / "cap_latest.ogg"
             older.write_bytes(b"older")
             latest.write_bytes(b"latest")
             os.utime(older, (100, 100))
@@ -305,13 +504,15 @@ class RbotUnitTests(unittest.TestCase):
             asyncio.run(rbot.renamecap.callback(context, new_name="Recovered"))
 
             self.assertTrue(older.exists())
-            self.assertEqual((sample_dir / "Recovered.wav").read_bytes(), b"latest")
+            self.assertTrue(latest.exists())
+            self.assertFalse((sample_dir / "Recovered.ogg").exists())
+            context.send.assert_awaited_once_with("You don't have a recent capture to rename. Run `!cap` first.")
 
     def test_renamecap_rejects_invalid_names_and_existing_files(self):
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
             sample_dir = Path(directory).resolve()
-            source = sample_dir / "cap_latest.wav"
-            existing = sample_dir / "Taken.wav"
+            source = sample_dir / "cap_latest.ogg"
+            existing = sample_dir / "Taken.ogg"
             source.write_bytes(b"capture")
             existing.write_bytes(b"keep this")
             rbot.SAMPLE_DIR = sample_dir
@@ -332,12 +533,13 @@ class RbotUnitTests(unittest.TestCase):
             "bad:name",
             "bad?name",
             "CON",
-            "LPT1.wav",
+            "LPT1.ogg",
             "sound.mp3",
+            "sound.wav",
         ]
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
             sample_dir = Path(directory).resolve()
-            source = sample_dir / "cap_latest.wav"
+            source = sample_dir / "cap_latest.ogg"
             source.write_bytes(b"capture")
             rbot.SAMPLE_DIR = sample_dir
             rbot.LAST_CAPTURES[(7, 42)] = source
