@@ -123,7 +123,28 @@ class RbotUnitTests(unittest.TestCase):
         self.assertEqual(rbot.play.callback.__module__, "revbot.commands.music")
         self.assertEqual(rbot.join.callback.__module__, "revbot.commands.voice")
         self.assertEqual(rbot.channel.callback.__module__, "revbot.commands.voice")
+        self.assertEqual(rbot.help.callback.__module__, "revbot.commands.general")
         self.assertEqual(rbot.about.callback.__module__, "revbot.commands.general")
+
+    def test_help_lists_commands_in_clean_categories(self):
+        context = SimpleNamespace(send=AsyncMock())
+        asyncio.run(rbot.help.callback(context))
+
+        embed = context.send.call_args.kwargs["embed"]
+        categories = {field.name: field.value for field in embed.fields}
+        self.assertEqual(embed.title, "Revbot commands")
+        self.assertIn("!play <URL>", categories["Music"])
+        self.assertIn("!v <sound>", categories["Soundboard"])
+        self.assertIn("!join", categories["Voice"])
+        self.assertIn("!help [command]", categories["General"])
+        self.assertIn("revbot_admin", next(value for name, value in categories.items() if name.startswith("Admin")))
+
+    def test_help_shows_details_for_one_command(self):
+        context = SimpleNamespace(send=AsyncMock())
+        asyncio.run(rbot.help.callback(context, command_name="channel"))
+        embed = context.send.call_args.kwargs["embed"]
+        self.assertEqual(embed.title, "!channel [#text-channel]")
+        self.assertIn("revbot_admin", embed.description)
 
     def test_channel_command_persists_and_clears_server_setting(self):
         with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
