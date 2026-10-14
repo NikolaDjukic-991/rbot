@@ -15,6 +15,51 @@ def register(bot, services):
     def is_within(path, root):
         return path != root and root in path.parents
 
+    def matching_sound_files(directory, sound_name, allowed_extensions, boundary):
+        """Resolve a sound by filename, accepting an optional audio extension."""
+        relative_name = Path(sound_name)
+        candidate = (directory / relative_name).resolve()
+        if not is_within(candidate, boundary):
+            raise ValueError("Invalid sound name")
+        requested_extension = relative_name.suffix.lower()
+        if requested_extension in allowed_extensions and candidate.is_file():
+            return [candidate]
+        if relative_name.suffix and requested_extension not in allowed_extensions:
+            if candidate.is_file():
+                return [candidate]
+
+        parent = (directory / relative_name.parent).resolve()
+        if parent != directory and not is_within(parent, boundary):
+            raise ValueError("Invalid sound name")
+        if not parent.is_dir():
+            return []
+        stem = (
+            relative_name.stem if requested_extension in allowed_extensions else relative_name.name
+        ).casefold()
+        matches = []
+        for path in parent.iterdir():
+            resolved = path.resolve()
+            if (
+                path.is_file()
+                and path.suffix.lower() in allowed_extensions
+                and (requested_extension not in allowed_extensions or path.suffix.lower() == requested_extension)
+                and path.stem.casefold() == stem
+                and is_within(resolved, boundary)
+            ):
+                matches.append(resolved)
+        return matches
+
+    def has_sound_stem(directory, stem, allowed_extensions, excluding=None):
+        if not directory.is_dir():
+            return False
+        return any(
+            path.resolve() != excluding
+            and path.is_file()
+            and path.suffix.lower() in allowed_extensions
+            and path.stem.casefold() == stem.casefold()
+            for path in directory.iterdir()
+        )
+
     @bot.command()
     async def v(ctx, byteName: str):
         """Play a guild sound or a shared sound from `globals/`; admins can play any sound."""
@@ -23,28 +68,34 @@ def register(bot, services):
                 raise ValueError("Soundbytes can only be played in a server.")
             sample_root = services.sample_dir().resolve()
             is_admin = services.is_revbot_admin(ctx)
+            sound_name = byteName.replace("\\", "/")
             if is_admin:
-                sound_path = (sample_root / byteName).resolve()
-                if not is_within(sound_path, sample_root):
-                    raise ValueError("Invalid sound name")
+                matches = matching_sound_files(
+                    sample_root, sound_name, services.soundboard_extensions(), sample_root
+                )
             else:
                 guild_root = services.guild_sound_dir(ctx.guild).resolve()
                 global_root = services.global_sound_dir().resolve()
-                sound_name = byteName.replace("\\", "/")
                 if sound_name.casefold().startswith("globals/"):
-                    sound_path = (global_root / sound_name[len("globals/"):]).resolve()
-                    if not is_within(sound_path, global_root):
-                        raise ValueError("Invalid sound name")
+                    matches = matching_sound_files(
+                        global_root,
+                        sound_name[len("globals/"):],
+                        services.soundboard_extensions(),
+                        global_root,
+                    )
                 else:
-                    local_path = (guild_root / sound_name).resolve()
-                    if not is_within(local_path, guild_root):
-                        raise ValueError("Invalid sound name")
-                    global_path = (global_root / sound_name).resolve()
-                    if not is_within(global_path, global_root):
-                        raise ValueError("Invalid sound name")
-                    sound_path = local_path if local_path.is_file() else global_path
-            if not sound_path.is_file():
+                    local_matches = matching_sound_files(
+                        guild_root, sound_name, services.soundboard_extensions(), guild_root
+                    )
+                    global_matches = matching_sound_files(
+                        global_root, sound_name, services.soundboard_extensions(), global_root
+                    )
+                    matches = local_matches + global_matches
+            if not matches:
                 raise FileNotFoundError("Sound not found in this server's or the global soundboard.")
+            if len(matches) > 1:
+                raise ValueError("More than one sound uses that name; specify its extension or use `globals/` for shared sounds.")
+            sound_path = matches[0]
             if sound_path.suffix.lower() not in services.soundboard_extensions():
                 raise ValueError("That file is not a supported soundbyte.")
             player = await services.player_manager().createAndRegisterNewPlayer(ctx)
@@ -58,7 +109,7 @@ def register(bot, services):
         """Capture and save the last five seconds of voice-channel audio.
 
         The bot must already be in your voice channel for five seconds. The Ogg clip is
-        saved in this server's soundboard directory and can be played with `!v <filename>`.
+        saved in this server's soundboard directory and can be played with `!v <name>`.
         """
         if ctx.guild is None:
             await ctx.send("Captures can only be saved in a server.")
@@ -84,7 +135,10 @@ def register(bot, services):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = "cap_{}.ogg".format(stamp)
         collision_index = 1
-        while (guild_directory / filename).exists() or (global_directory / filename).exists():
+        while (
+            has_sound_stem(guild_directory, Path(filename).stem, services.soundboard_extensions())
+            or has_sound_stem(global_directory, Path(filename).stem, services.soundboard_extensions())
+        ):
             filename = "cap_{}_{}.ogg".format(stamp, collision_index)
             collision_index += 1
         destination = guild_directory / filename
@@ -101,7 +155,7 @@ def register(bot, services):
             return
         services.last_captures[(ctx.guild.id, ctx.author.id)] = destination
         await ctx.send(
-            "Saved the last five seconds. Name it with `!renamecap <name>`, then play it with `!v <name>.ogg`."
+            "Saved the last five seconds. Name it with `!renamecap <name>`, then play it with `!v <name>` (extension optional when the name is unique)."
         )
 
     @bot.command()
@@ -142,10 +196,12 @@ def register(bot, services):
         if destination == source.resolve():
             await ctx.send("That capture already has that name.")
             return
-        if destination.exists():
+        if has_sound_stem(
+            guild_directory, stem, services.soundboard_extensions(), excluding=source.resolve()
+        ):
             await ctx.send("A soundbyte with that name already exists.")
             return
-        if (global_directory / destination.name).exists():
+        if has_sound_stem(global_directory, stem, services.soundboard_extensions()):
             await ctx.send("A global soundbyte already uses that name; choose a different name.")
             return
 
@@ -157,7 +213,11 @@ def register(bot, services):
             return
 
         services.last_captures[(ctx.guild.id, ctx.author.id)] = destination
-        await ctx.send("Renamed your latest capture to `{}`. Play it with `!v {}`.".format(destination.name, destination.name))
+        await ctx.send(
+            "Renamed your latest capture to `{}`. Play it with `!v {}` (extension optional when the name is unique).".format(
+                destination.name, destination.stem
+            )
+        )
 
     @bot.command(aliases=["soundbytes", "sounds"])
     async def soundboard(ctx):
@@ -187,7 +247,7 @@ def register(bot, services):
             await ctx.send("No soundbytes found in this server's soundboard.")
             return
 
-        header = "Soundboard sounds (play one with `!v <filename>`; `globals/` sounds are shared):\n"
+        header = "Soundboard sounds (play one with `!v <name>`; extension optional when unique, `globals/` sounds are shared):\n"
         chunks = []
         current = header
         for sound in sounds:
