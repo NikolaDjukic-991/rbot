@@ -3,6 +3,7 @@ temp/
 soundbytes/
 config.cfg
 command_channels.json
+guild_volumes.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -13,9 +13,10 @@ async def find_voice_channel_by_member(guild, member):
 
 
 class PlayerManager:
-    def __init__(self, bot_client, player_factory=None):
+    def __init__(self, bot_client, player_factory=None, volume_store=None):
         self.bot = bot_client
         self.player_factory = player_factory
+        self.volume_store = volume_store
         self.players = {}
 
     def getPlayerByGuildId(self, guild_id):
@@ -29,6 +30,10 @@ class PlayerManager:
         player = self.players.get(guild_id)
         if player is None:
             player = self.player_factory(voice_client) if self.player_factory else Player(voice_client, self.bot.loop)
+            if self.volume_store is not None:
+                player._guild_id = guild_id
+                player._volume_store = self.volume_store
+                player._volume_percent = self.volume_store.get(guild_id)
             self.players[guild_id] = player
         else:
             player.voiceClient = voice_client

@@ -98,6 +98,8 @@ class RbotUnitTests(unittest.TestCase):
         rbot.TEMP_DIR = REPOSITORY_DIR / "temp"
         rbot.FFMPEG_EXECUTABLE = "ffmpeg"
         rbot.COMMAND_CHANNELS = None
+        rbot.VOLUME_SETTINGS = None
+        rbot.playerManager.volume_store = None
         rbot.LAST_CAPTURES.clear()
 
     def test_required_commands_are_exposed(self):
@@ -180,6 +182,63 @@ class RbotUnitTests(unittest.TestCase):
             self.assertIn("<#99>", context.send.await_args_list[0].args[0])
             self.assertIn("all text channels", context.send.await_args_list[1].args[0])
 
+    def test_guild_volume_store_persists_valid_values_per_guild(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
+            path = Path(directory) / "guild_volumes.json"
+            store = rbot.GuildVolumeStore(path)
+            self.assertEqual(store.get(7), 100)
+            store.set(7, 65)
+            store.set(8, 125)
+
+            reloaded = rbot.GuildVolumeStore(path)
+            reloaded.load()
+            self.assertEqual(reloaded.get(7), 65)
+            self.assertEqual(reloaded.get(8), 125)
+            self.assertEqual(reloaded.get(9), 100)
+
+    def test_guild_volume_store_ignores_invalid_values_and_rejects_invalid_updates(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
+            path = Path(directory) / "guild_volumes.json"
+            path.write_text(
+                '{"7": 55, "8": 201, "9": "80", "invalid": 40}',
+                encoding="utf-8",
+            )
+            store = rbot.GuildVolumeStore(path)
+            store.load()
+            self.assertEqual(store.get(7), 55)
+            self.assertEqual(store.get(8), 100)
+            self.assertEqual(store.get(9), 100)
+            with self.assertRaises(ValueError):
+                store.set(7, 201)
+
+    def test_player_manager_restores_and_persists_guild_volume(self):
+        with tempfile.TemporaryDirectory(dir=TEST_ENVIRONMENT) as directory:
+            store = rbot.GuildVolumeStore(Path(directory) / "guild_volumes.json")
+            store.set(7, 65)
+            store.load()
+            player = rbot.Player.__new__(rbot.Player)
+            player._lock = threading.RLock()
+            player._mixer = None
+            player._volume_percent = 100
+            player._volume_store = None
+            player._guild_id = None
+            voice_client = FakeVoiceClient()
+            manager = rbot.PlayerManager(
+                SimpleNamespace(loop=None, voice_clients=[]),
+                player_factory=lambda _: player,
+                volume_store=store,
+            )
+            context = SimpleNamespace(guild=SimpleNamespace(id=7), author=object())
+            with patch("revbot.audio.manager.join_voice_channel", AsyncMock(return_value=voice_client)):
+                restored = asyncio.run(manager.createAndRegisterNewPlayer(context))
+
+            self.assertIs(restored, player)
+            self.assertEqual(player.getVolume(), 65)
+            player.setVolume(82)
+            reloaded = rbot.GuildVolumeStore(store.path)
+            reloaded.load()
+            self.assertEqual(reloaded.get(7), 82)
+
     def test_command_filter_limits_commands_to_configured_text_channel(self):
         store = rbot.CommandChannelStore(Path(TEST_ENVIRONMENT) / "channel-filter-test.json")
         store.set(7, 99)
@@ -226,6 +285,8 @@ class RbotUnitTests(unittest.TestCase):
             self.assertEqual(rbot.SAMPLE_DIR, (root / "samples").resolve())
             self.assertEqual(rbot.TEMP_DIR, (root / "temp").resolve())
             self.assertEqual(rbot.FFMPEG_EXECUTABLE, "fake-ffmpeg")
+            self.assertEqual(rbot.VOLUME_SETTINGS.path, root / "guild_volumes.json")
+            self.assertIs(rbot.playerManager.volume_store, rbot.VOLUME_SETTINGS)
             self.assertFalse(expired_capture.exists())
             self.assertTrue((root / "samples" / "globals").is_dir())
 

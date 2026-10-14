@@ -25,6 +25,8 @@ class Player:
         self._mixer = None
         self._music_paused = False
         self._volume_percent = 100
+        self._volume_store = None
+        self._guild_id = None
         self.capture_sink = RecentVoiceSink()
         self.start_capture()
 
@@ -115,6 +117,10 @@ class Player:
         if percent < 0 or percent > 200:
             raise ValueError("Volume must be between 0 and 200.")
         with self._lock:
+            volume_store = getattr(self, "_volume_store", None)
+            guild_id = getattr(self, "_guild_id", None)
+            if volume_store is not None and guild_id is not None:
+                volume_store.set(guild_id, percent)
             self._volume_percent = percent
             if self._mixer is not None:
                 self._mixer.set_master_volume(percent / 100)

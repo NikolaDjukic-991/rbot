@@ -47,6 +47,7 @@ from revbot.audio.player import Player
 from revbot.audio.manager import PlayerManager, find_voice_channel_by_member, join_voice_channel
 from revbot.audio.storage import global_sound_directory, guild_sound_directory, has_revbot_admin_role
 from revbot.command_channels import CommandChannelStore
+from revbot.volume_settings import GuildVolumeStore
 from revbot.config import (
     ConfigurationError,
     expand_config_path,
@@ -77,6 +78,7 @@ CAPTURE_BITRATE = "64k"
 CAPTURE_EXTENSIONS = {".ogg", ".wav"}
 UNNAMED_CAPTURE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 COMMAND_CHANNELS = None
+VOLUME_SETTINGS = None
 
 intents = discord.Intents.all()
 intents.members = True
@@ -117,7 +119,7 @@ def _is_configured_token(token):
 
 
 def globalInit():
-    global RBOT_HOME, TOKEN, SAMPLE_DIR, TEMP_DIR, FFMPEG_EXECUTABLE, COMMAND_CHANNELS
+    global RBOT_HOME, TOKEN, SAMPLE_DIR, TEMP_DIR, FFMPEG_EXECUTABLE, COMMAND_CHANNELS, VOLUME_SETTINGS
 
     bot_home = Path(os.environ.get("RBOT_HOME", Path(__file__).resolve().parent)).expanduser().resolve()
     try:
@@ -133,6 +135,9 @@ def globalInit():
     RBOT_HOME = settings.bot_home
     COMMAND_CHANNELS = CommandChannelStore(RBOT_HOME / "command_channels.json")
     COMMAND_CHANNELS.load()
+    VOLUME_SETTINGS = GuildVolumeStore(RBOT_HOME / "guild_volumes.json")
+    VOLUME_SETTINGS.load()
+    playerManager.volume_store = VOLUME_SETTINGS
     TOKEN = settings.token
     SAMPLE_DIR = settings.sample_dir
     TEMP_DIR = settings.temp_dir
