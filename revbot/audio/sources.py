@@ -61,6 +61,7 @@ class BufferedPCMSource:
         self.source = source
         self.frames = queue.Queue(maxsize=8)
         self.stopped = threading.Event()
+        self.finished = threading.Event()
         self.worker = threading.Thread(target=self._produce, daemon=True)
         self.worker.start()
 
@@ -84,11 +85,16 @@ class BufferedPCMSource:
             if not self.stopped.is_set():
                 logging.exception("Error decoding audio")
                 self._put(None)
+        finally:
+            self.finished.set()
 
-    def read_frame(self):
+    def read_frame(self, block=True):
         if self.stopped.is_set():
             return None
-        return self.frames.get()
+        try:
+            return self.frames.get(block=block)
+        except queue.Empty:
+            return None if self.finished.is_set() else b""
 
     def cleanup(self):
         if self.stopped.is_set():

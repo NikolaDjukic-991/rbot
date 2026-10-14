@@ -82,6 +82,16 @@ def pcm_frame(value, samples=rbot.AudioMixer.FRAME_SAMPLES * rbot.AudioMixer.CHA
 
 
 class RbotUnitTests(unittest.TestCase):
+    @staticmethod
+    def read_non_silent_frame(mixer, timeout=1.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            frame = mixer.read()
+            if frame and any(frame):
+                return frame
+            time.sleep(0.001)
+        raise AssertionError("Audio source did not produce a frame before timeout")
+
     def setUp(self):
         rbot.RBOT_HOME = PROJECT_DIR
         rbot.SAMPLE_DIR = SAMPLE_FILE.parent.resolve()
@@ -275,7 +285,7 @@ class RbotUnitTests(unittest.TestCase):
         sound_request = Mock(create_source=Mock(return_value=FakeSource([pcm_frame(30000)])))
         mixer = rbot.AudioMixer(deque([music_request]), deque([sound_request]), threading.RLock())
         samples = array.array("h")
-        samples.frombytes(mixer.read())
+        samples.frombytes(self.read_non_silent_frame(mixer))
         self.assertEqual(samples[0], 32767)
         self.assertEqual(len(samples), rbot.AudioMixer.FRAME_SAMPLES * rbot.AudioMixer.CHANNELS)
         mixer.cleanup()
@@ -284,10 +294,10 @@ class RbotUnitTests(unittest.TestCase):
         first = Mock(create_source=Mock(return_value=FakeSource([pcm_frame(10), pcm_frame(10)])))
         second = Mock(create_source=Mock(return_value=FakeSource([pcm_frame(20)])))
         mixer = rbot.AudioMixer(deque([first, second]), deque(), threading.RLock())
-        mixer.read()
+        self.read_non_silent_frame(mixer)
         mixer.skip_music()
         frame = array.array("h")
-        frame.frombytes(mixer.read())
+        frame.frombytes(self.read_non_silent_frame(mixer))
         self.assertEqual(frame[0], int(20 * mixer.MUSIC_GAIN))
         mixer.cleanup()
 
@@ -298,12 +308,12 @@ class RbotUnitTests(unittest.TestCase):
         mixer.pause_music()
 
         paused_frame = array.array("h")
-        paused_frame.frombytes(mixer.read())
+        paused_frame.frombytes(self.read_non_silent_frame(mixer))
         self.assertEqual(paused_frame[0], int(200 * mixer.SOUNDBOARD_GAIN))
 
         mixer.resume_music()
         resumed_frame = array.array("h")
-        resumed_frame.frombytes(mixer.read())
+        resumed_frame.frombytes(self.read_non_silent_frame(mixer))
         self.assertEqual(resumed_frame[0], int(100 * mixer.MUSIC_GAIN))
         mixer.cleanup()
 
@@ -315,10 +325,42 @@ class RbotUnitTests(unittest.TestCase):
         mixer = rbot.AudioMixer(deque([music_request]), deque(), threading.RLock())
         mixer.set_master_volume(0.5)
         samples = array.array("h")
-        samples.frombytes(mixer.read())
+        samples.frombytes(self.read_non_silent_frame(mixer))
         self.assertEqual(samples[0], int(100 * mixer.MUSIC_GAIN * 0.5))
         self.assertIs(mixer.current_requests()[0], music_request)
         mixer.cleanup()
+
+    def test_mixer_does_not_wait_for_music_or_soundboard_startup(self):
+        music_startup = threading.Event()
+        sound_startup = threading.Event()
+        release_startup = threading.Event()
+
+        def slow_create_source(startup, sample):
+            startup.set()
+            release_startup.wait(timeout=1)
+            return FakeSource([pcm_frame(sample)])
+
+        music = Mock(create_source=lambda: slow_create_source(music_startup, 500))
+        sound = Mock(create_source=lambda: slow_create_source(sound_startup, 200))
+        mixer = rbot.AudioMixer(deque([music]), deque([sound]), threading.RLock())
+        try:
+            started = time.monotonic()
+            frame = mixer.read()
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 0.1)
+            self.assertEqual(len(frame), mixer.FRAME_BYTES)
+            self.assertFalse(any(frame))
+            self.assertTrue(music_startup.wait(timeout=0.5))
+            self.assertTrue(sound_startup.wait(timeout=0.5))
+
+            release_startup.set()
+            samples = array.array("h")
+            samples.frombytes(self.read_non_silent_frame(mixer))
+            expected = int((500 * mixer.MUSIC_GAIN) + (200 * mixer.SOUNDBOARD_GAIN))
+            self.assertEqual(samples[0], expected)
+        finally:
+            release_startup.set()
+            mixer.cleanup()
 
     def test_recent_voice_snapshot_encodes_ogg_opus_output(self):
         sink = rbot.RecentVoiceSink()

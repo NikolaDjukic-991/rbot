@@ -3,6 +3,7 @@
 import array
 import logging
 import sys
+import threading
 
 import discord
 
@@ -26,6 +27,10 @@ class AudioMixer(discord.AudioSource):
         self.sound_source = None
         self.music_request = None
         self.sound_request = None
+        self.music_starting = False
+        self.sound_starting = False
+        self.music_generation = 0
+        self.sound_generation = 0
         self.master_volume = 1.0
         self.skip_music_requested = False
         self.skip_sound_requested = False
@@ -39,6 +44,36 @@ class AudioMixer(discord.AudioSource):
                 source.cleanup()
             except Exception:
                 logging.exception("Failed to clean up an audio source")
+
+    def _start_source(self, kind, request, generation):
+        """Create FFmpeg and its decode buffer away from Discord's audio thread."""
+        try:
+            source = BufferedPCMSource(request.create_source())
+        except Exception:
+            logging.exception("Could not start queued %s audio", kind)
+            source = None
+
+        source_attr = "{}_source".format(kind)
+        request_attr = "{}_request".format(kind)
+        starting_attr = "{}_starting".format(kind)
+        generation_attr = "{}_generation".format(kind)
+        with self.lock:
+            valid = (
+                not self.closed
+                and getattr(self, generation_attr) == generation
+                and getattr(self, request_attr) is request
+                and getattr(self, starting_attr)
+            )
+            if valid:
+                setattr(self, source_attr, source)
+                setattr(self, starting_attr, False)
+                if source is None:
+                    setattr(self, request_attr, None)
+            else:
+                source_to_cleanup = source
+                source = None
+        if not valid:
+            self._cleanup(source_to_cleanup)
 
     def skip_music(self):
         with self.lock:
@@ -67,53 +102,75 @@ class AudioMixer(discord.AudioSource):
     def _read_next_frame(self, kind):
         queue = self.music_queue if kind == "music" else self.sound_queue
         source_attr = "music_source" if kind == "music" else "sound_source"
-        while not self.closed:
-            with self.lock:
-                source = getattr(self, source_attr)
-                skip_attr = "skip_{}_requested".format(kind)
-                if getattr(self, skip_attr):
-                    setattr(self, skip_attr, False)
-                    setattr(self, source_attr, None)
-                    setattr(self, "{}_request".format(kind), None)
-                    discarded = source
-                    source = None
-                else:
-                    discarded = None
-                if source is None and queue and not (kind == "music" and self.music_paused):
-                    request = queue.popleft()
-                    try:
-                        source = BufferedPCMSource(request.create_source())
-                    except Exception:
-                        logging.exception("Could not start queued %s audio", kind)
-                        source = None
-                    setattr(self, source_attr, source)
-                    if source is not None:
-                        setattr(self, "{}_request".format(kind), request)
-            self._cleanup(discarded)
-            if kind == "music":
-                with self.lock:
-                    if self.music_paused:
-                        return None
-            if source is None:
-                with self.lock:
-                    if kind == "music" and self.music_paused:
-                        return None
-                    if not queue:
-                        return None
-                continue
-            try:
-                frame = source.read_frame()
-            except Exception:
-                logging.exception("Error reading %s audio", kind)
-                frame = b""
-            if frame:
-                return frame[: self.FRAME_BYTES]
-            with self.lock:
-                if getattr(self, source_attr) is source:
-                    setattr(self, source_attr, None)
-                    setattr(self, "{}_request".format(kind), None)
-            self._cleanup(source)
-        return None
+        request_attr = "{}_request".format(kind)
+        starting_attr = "{}_starting".format(kind)
+        generation_attr = "{}_generation".format(kind)
+        with self.lock:
+            if self.closed:
+                return None
+            source = getattr(self, source_attr)
+            skip_attr = "skip_{}_requested".format(kind)
+            discarded = None
+            if getattr(self, skip_attr):
+                setattr(self, skip_attr, False)
+                setattr(self, generation_attr, getattr(self, generation_attr) + 1)
+                setattr(self, source_attr, None)
+                setattr(self, request_attr, None)
+                setattr(self, starting_attr, False)
+                discarded = source
+                source = None
+
+            paused = kind == "music" and self.music_paused
+            if not paused and source is None and not getattr(self, starting_attr) and queue:
+                request = queue.popleft()
+                setattr(self, request_attr, request)
+                setattr(self, starting_attr, True)
+                generation = getattr(self, generation_attr)
+                threading.Thread(
+                    target=self._start_source,
+                    args=(kind, request, generation),
+                    name="{}-audio-start".format(kind),
+                    daemon=True,
+                ).start()
+                starting = True
+            else:
+                starting = getattr(self, starting_attr)
+        self._cleanup(discarded)
+        if paused:
+            return None
+        if source is None:
+            if starting:
+                return b""
+            return None
+
+        try:
+            frame = source.read_frame(block=False)
+        except Exception:
+            logging.exception("Error reading %s audio", kind)
+            frame = None
+        if frame:
+            return frame[: self.FRAME_BYTES]
+        if frame == b"":
+            return b""
+
+        with self.lock:
+            if getattr(self, source_attr) is source:
+                setattr(self, source_attr, None)
+                setattr(self, request_attr, None)
+                setattr(self, generation_attr, getattr(self, generation_attr) + 1)
+                if queue and not (kind == "music" and self.music_paused):
+                    next_request = queue.popleft()
+                    setattr(self, request_attr, next_request)
+                    setattr(self, starting_attr, True)
+                    generation = getattr(self, generation_attr)
+                    threading.Thread(
+                        target=self._start_source,
+                        args=(kind, next_request, generation),
+                        name="{}-audio-start".format(kind),
+                        daemon=True,
+                    ).start()
+        self._cleanup(source)
+        return b"" if getattr(self, starting_attr) else None
 
     @staticmethod
     def _as_samples(frame):
